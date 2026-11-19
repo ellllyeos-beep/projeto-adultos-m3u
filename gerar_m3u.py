@@ -1,155 +1,169 @@
+"""Gera playlist apenas de fontes com autorização registrada pelo mantenedor."""
+import ipaddress
 import json
 import re
-from urllib.parse import urlparse
+import socket
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, urljoin
 import requests
 
-TIMEOUT = 15
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; M3U-Generator/1.0)"}
-
-ADULT_TERMS = (
-    "xxx", "adult", "adulto", "adultos", "18+", "porn", "pornographic",
-    "sex", "sexy", "erotic", "erotico", "erótica", "playboy", "venus", "hot"
-)
+TIMEOUT = (5, 15)
+MAX_SOURCE = 4 * 1024 * 1024
+BASE = Path(__file__).resolve().parent
+ADULT_TERMS = re.compile(r'(?<!\w)(?:xxx|adultos?|adults?|18\+|porn\w*|sex|sexy|erotic\w*|erótic\w*|playboy|venus)(?!\w)', re.I)
 
 
-def baixar(url):
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+def canonical_url(url):
+    if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url):
+        raise ValueError('URL inválida')
+    p = urlsplit(url)
+    if p.scheme not in ('http', 'https') or not p.hostname or p.username or p.password or p.fragment:
+        raise ValueError('URL HTTP(S) pública sem credenciais ou fragmento exigida')
+    host = p.hostname.lower()
+    port = p.port
+    authority = f'[{host}]' if ':' in host else host
+    if port and (p.scheme, port) not in (('http', 80), ('https', 443)):
+        authority += f':{port}'
+    return urlunsplit((p.scheme, authority, p.path or '/', p.query, ''))
+
+
+def public_url(url, domains):
+    url = canonical_url(url)
+    p = urlsplit(url)
+    if p.hostname not in domains:
+        raise ValueError('Domínio fora da autorização')
+    addresses = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == 'https' else 80), type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+        raise ValueError('Destino não público')
+    return url
+
+
+def fetch(url, domains, limit):
+    # Redirecionamentos são conferidos antes de cada conexão; nunca usa cookies/proxy do ambiente.
+    with requests.Session() as session:
+        session.trust_env = False
+        for _ in range(6):
+            url = public_url(url, domains)
+            with session.get(url, timeout=TIMEOUT, stream=True, allow_redirects=False,
+                             headers={'User-Agent': 'Authorized-M3U/2.0'}) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    url = urljoin(url, response.headers.get('Location', ''))
+                    continue
+                response.raise_for_status()
+                if response.status_code not in (200, 206):
+                    raise ValueError('Resposta sem conteúdo de mídia')
+                data = bytearray()
+                for chunk in response.iter_content(4096):
+                    data.extend(chunk[:limit - len(data)])
+                    if len(data) >= limit:
+                        break
+                return bytes(data), response.headers.get('Content-Type', '').split(';')[0].lower()
+    raise ValueError('Excesso de redirecionamentos')
 
 
 def parse_m3u(text):
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
-    out = []
-    i = 0
-    while i < len(lines):
-        if lines[i].startswith("#EXTINF") and i + 1 < len(lines):
-            info = lines[i]
-            stream = lines[i + 1]
-            if not stream.startswith("#"):
-                nome = info.split(",", 1)[1].strip() if "," in info else "Canal Adulto"
-                attrs = dict(re.findall(r'([A-Za-z0-9_-]+)="([^"]*)"', info))
-                out.append((info, nome, attrs, stream))
-                i += 2
-                continue
-        i += 1
-    return out
+    pending = None
+    for line in text.lstrip('\ufeff').splitlines():
+        line = line.strip()
+        if line.startswith('#EXTINF:'):
+            # A vírgula dentro de atributos entre aspas não separa o nome.
+            match = re.match(r'^#EXTINF:((?:[^",]|"[^"]*")*),(.*)$', line)
+            pending = (match[2].strip(), dict(re.findall(r'([\w-]+)="([^"]*)"', match[1]))) if match else None
+        elif line and not line.startswith('#'):
+            if pending:
+                yield (*pending, line)
+            pending = None
 
 
 def eh_adulto(nome, attrs):
-    texto = " ".join([
-        nome,
-        attrs.get("group-title", ""),
-        attrs.get("tvg-name", ""),
-        attrs.get("tvg-id", "")
-    ]).lower()
-    return any(term in texto for term in ADULT_TERMS)
-
-
-def stream_ativo(url):
-    try:
-        # Primeiro tenta HEAD; alguns servidores não suportam HEAD.
-        try:
-            r = requests.head(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-            if r.status_code < 400:
-                r.close()
-                return True
-        except requests.RequestException:
-            pass
-
-        r = requests.get(
-            url,
-            headers={**HEADERS, "Range": "bytes=0-2048"},
-            timeout=TIMEOUT,
-            stream=True,
-            allow_redirects=True,
-        )
-        ok = r.status_code < 400
-        r.close()
-        return ok
-    except requests.RequestException:
-        return False
-
-
-def limpar_nome(nome):
-    nome = re.sub(r"^Logo canal\s*", "", nome, flags=re.I)
-    nome = re.sub(r"^logo\s*[:\-]\s*", "", nome, flags=re.I)
-    return re.sub(r"\s+", " ", nome).strip() or "Canal Adulto"
+    return bool(ADULT_TERMS.search(' '.join([nome, *(attrs.get(k, '') for k in ('group-title', 'tvg-name', 'tvg-id'))])))
 
 
 def montar_extinf(nome, attrs):
-    nome = limpar_nome(nome)
-    attrs = dict(attrs)
-    attrs["tvg-name"] = attrs.get("tvg-name") or nome
-    attrs["tvg-country"] = attrs.get("tvg-country") or ""
-    attrs["tvg-language"] = attrs.get("tvg-language") or ""
-    attrs["group-title"] = "Adultos"
-    # Não inventa logos/EPG; preserva somente metadados existentes.
-    ordem = ["tvg-id", "tvg-name", "tvg-logo", "tvg-country", "tvg-language", "group-title"]
-    partes = []
-    for k in ordem:
-        if attrs.get(k):
-            partes.append(f'{k}="{attrs[k]}"')
-    return "#EXTINF:-1 " + " ".join(partes) + "," + nome
+    def clean(value):
+        return ' '.join(str(value).replace('"', "'").split())
+    attrs = {k: clean(v) for k, v in attrs.items() if re.fullmatch(r'[\w-]+', k)}
+    attrs['tvg-name'] = attrs.get('tvg-name') or clean(nome)
+    attrs['group-title'] = 'Adultos'
+    return '#EXTINF:-1 ' + ' '.join(f'{k}="{v}"' for k, v in sorted(attrs.items()) if v) + ',' + clean(nome)
+
+
+def stream_ativo(url, domains):
+    data, mime = fetch(url, domains, 8192)
+    prefix = data.lstrip(b'\xef\xbb\xbf\r\n\t ')
+    if prefix.startswith(b'#EXTM3U'):
+        return b'#EXT-X-' in prefix
+    if prefix.startswith(b'<') or mime in ('text/html', 'application/json'):
+        return False
+    return bool(data) and (mime.startswith(('video/', 'audio/')) or (len(data) > 188 and data[0] == 0x47 and data[188] == 0x47))
+
+
+def authorized(source):
+    auth = source.get('autorizacao', {})
+    return (auth.get('confirmada') is True and bool(auth.get('evidencia', '').strip())
+            and bool(source.get('dominios_stream')) and bool(source.get('dominios_fonte')))
+
+
+def generate(sources):
+    output = ['#EXTM3U']
+    seen = set()
+    status = dict(fontes_configuradas=len(sources), fontes_sem_autorizacao=0,
+                  entradas_m3u_lidas=0, entradas_identificadas_como_adultas=0,
+                  duplicados=0, urls_rejeitadas=0, removidos_por_falha_no_teste=0,
+                  canais_ativos=0, erros_de_fontes=[])
+    for source in sources:
+        if not authorized(source):
+            status['fontes_sem_autorizacao'] += 1
+            continue
+        try:
+            data, _ = fetch(source['url'], source['dominios_fonte'], MAX_SOURCE + 1)
+            if len(data) > MAX_SOURCE or not data.decode('utf-8-sig').lstrip().startswith('#EXTM3U'):
+                raise ValueError('Fonte não é uma playlist M3U válida ou excede limite')
+            entries = list(parse_m3u(data.decode('utf-8-sig')))
+        except (requests.RequestException, ValueError, OSError, KeyError) as exc:
+            status['erros_de_fontes'].append({'fonte': source.get('nome', ''), 'erro': type(exc).__name__})
+            continue
+        for name, attrs, url in entries:
+            status['entradas_m3u_lidas'] += 1
+            if not eh_adulto(name, attrs):
+                continue
+            status['entradas_identificadas_como_adultas'] += 1
+            try:
+                key = canonical_url(url)
+                if urlsplit(key).hostname not in source['dominios_stream']:
+                    raise ValueError('Domínio não autorizado')
+            except ValueError:
+                status['urls_rejeitadas'] += 1
+                continue
+            if key in seen:
+                status['duplicados'] += 1
+                continue
+            seen.add(key)
+            try:
+                active = stream_ativo(key, source['dominios_stream'])
+            except (requests.RequestException, ValueError, OSError):
+                active = False
+            if not active:
+                status['removidos_por_falha_no_teste'] += 1
+                continue
+            output.extend((montar_extinf(name, attrs), key))
+            status['canais_ativos'] += 1
+    return '\n'.join(output) + '\n', status
 
 
 def main():
-    with open("fontes.json", encoding="utf-8") as f:
-        fontes = json.load(f)["fontes"]
-
-    saida = ["#EXTM3U"]
-    vistos = set()
-    encontrados = 0
-    adultos = 0
-    ativos = 0
-    erros = []
-
-    for fonte in fontes:
-        print(f"\n[FONTE] {fonte['nome']}")
-        try:
-            texto = baixar(fonte["url"])
-            canais = parse_m3u(texto)
-        except Exception as e:
-            erros.append({"fonte": fonte["nome"], "erro": str(e)})
-            print(f"[ERRO] {e}")
-            continue
-
-        for info, nome, attrs, stream in canais:
-            encontrados += 1
-            if not eh_adulto(nome, attrs):
-                continue
-            adultos += 1
-            chave = stream.strip().lower()
-            if not chave or chave in vistos:
-                continue
-
-            print(f"[TESTE] {limpar_nome(nome)}")
-            if not stream_ativo(stream):
-                print("  -> OFFLINE")
-                continue
-
-            vistos.add(chave)
-            saida.append(montar_extinf(nome, attrs))
-            saida.append(stream.strip())
-            ativos += 1
-            print("  -> ATIVO")
-
-    with open("adultos.m3u", "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(saida) + "\n")
-
-    status = {
-        "fontes_configuradas": len(fontes),
-        "entradas_m3u_lidas": encontrados,
-        "entradas_identificadas_como_adultas": adultos,
-        "canais_ativos": ativos,
-        "removidos_por_falha_no_teste": adultos - ativos,
-        "erros_de_fontes": erros,
-    }
-    with open("status.json", "w", encoding="utf-8") as f:
-        json.dump(status, f, ensure_ascii=False, indent=2)
-
-    print(f"\nConcluído: {ativos} canais ativos gravados em adultos.m3u")
+    sources = json.loads((BASE / 'fontes.json').read_text(encoding='utf-8'))['fontes']
+    playlist, status = generate(sources)
+    # Falha de fonte não apaga a última playlist publicada.
+    if status['erros_de_fontes']:
+        raise SystemExit('Falha ao consultar fontes; arquivos anteriores preservados')
+    for name, text in [('adultos.m3u', playlist), ('status.json', json.dumps(status, ensure_ascii=False, indent=2) + '\n')]:
+        target = BASE / name
+        temporary = target.with_suffix(target.suffix + '.tmp')
+        temporary.write_text(text, encoding='utf-8', newline='\n')
+        temporary.replace(target)
+    print(json.dumps(status, ensure_ascii=False))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

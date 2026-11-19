@@ -1,45 +1,46 @@
-# Gerador M3U — Canais Adultos
+# Gerador M3U de streams públicos autorizados
 
-Gerador automático de playlist M3U para uso em players compatíveis, incluindo SS IPTV.
+O gerador só consulta fontes com autorização registrada. Uma URL pública ou resposta HTTP 200 não comprova direitos de distribuição. As fontes anteriores foram desativadas porque não traziam evidência de autorização; nenhuma fonte nova foi presumida autorizada.
 
-## O que o projeto faz
+## Configuração
 
-- reúne várias fontes M3U públicas configuradas em `fontes.json`;
-- identifica entradas da categoria adulta;
-- remove duplicados pelo endereço do stream;
-- testa cada stream antes de colocá-lo na playlist final;
-- remove automaticamente streams que falharem no teste;
-- preserva `tvg-name` e outros metadados quando fornecidos pela fonte;
-- força `group-title="Adultos"` para organização no SS IPTV;
-- atualiza automaticamente a cada 6 horas pelo GitHub Actions;
-- gera `adultos.m3u` e `status.json` no diretório principal.
+Em `fontes.json`, adicione objetos à lista `fontes` com os campos:
 
-## Arquivos
+```json
+{
+  "nome": "Fornecedor autorizado",
+  "url": "https://provider.example/playlist.m3u",
+  "dominios_fonte": ["provider.example"],
+  "dominios_stream": ["media.provider.example"],
+  "autorizacao": {
+    "confirmada": true,
+    "evidencia": "URL dos termos ou referência da permissão do titular para estes streams"
+  }
+}
+```
 
-- `fontes.json` — URLs das fontes de entrada.
-- `gerar_m3u.py` — coletor, filtro e testador dos streams.
-- `adultos.m3u` — playlist final gerada automaticamente.
-- `status.json` — resumo da última execução.
-- `requirements.txt` — dependência Python.
-- `.github/workflows/atualizar.yml` — atualização automática.
+O mantenedor deve verificar a evidência e seu alcance antes de confirmar. A declaração é um registro manual, não uma verificação jurídica automática. Domínios são exatos, em minúsculas; inclua explicitamente CDNs e destinos de redirecionamento permitidos. Não use URLs com credenciais ou tokens privados em um repositório público.
 
-## Instalação no GitHub
+## Execução e testes
 
-1. Crie um repositório no GitHub.
-2. Envie todos os arquivos mantendo a pasta `.github/workflows/`.
-3. Abra **Actions** e execute manualmente `Atualizar lista M3U Adultos` na primeira vez.
-4. Depois disso, o GitHub Actions executará a atualização a cada 6 horas.
+Python 3.12:
 
-## URL para o SS IPTV
+```sh
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python gerar_m3u.py
+```
 
-Se o GitHub Pages estiver habilitado para o repositório, a URL terá o formato:
+Os arquivos são resolvidos em relação ao script. Configuração vazia produz somente `#EXTM3U`. Falhas ao consultar fontes encerram a execução sem substituir os arquivos anteriores. Falhas individuais de streams removem somente esses streams. Cada arquivo é substituído atomicamente; os dois arquivos não constituem uma transação conjunta.
 
-`https://SEU-USUARIO.github.io/SEU-REPOSITORIO/adultos.m3u`
+A validação usa GET com leitura limitada e timeout, rejeita HTML e exige assinatura HLS ou conteúdo de mídia. É uma verificação pontual, não garantia de reprodução completa ou disponibilidade futura. Não verifica segmentos HLS nem DRM. DNS público é conferido antes das conexões, mas isso não fornece isolamento contra DNS rebinding; use apenas fornecedores confiáveis.
 
-Também é possível usar a URL `raw.githubusercontent.com` do arquivo `adultos.m3u`.
+A deduplicação normaliza esquema, hostname e portas padrão, preservando maiúsculas, caminho e query. Cada URL é testada uma vez por execução, mesmo quando falha. Contadores distinguem duplicados, URLs rejeitadas e falhas de mídia. Metadados são preservados e higienizados.
 
-## Fontes configuradas
+## GitHub Actions
 
-As fontes foram escolhidas por serem playlists públicas encontradas na web. O projeto apenas lê e testa os endereços fornecidos por elas; não hospeda nem fornece o conteúdo de vídeo.
+`testes.yml` verifica pushes e pull requests sem escrever no repositório. `atualizar.yml` testa antes de gerar, evita execuções concorrentes e publica somente os dois arquivos gerados na main. Agenda: `17 */6 * * *`, às 00:17, 06:17, 12:17 e 18:17 UTC (20:17 do dia anterior, 02:17, 08:17 e 14:17 em Cuiabá).
 
-Use apenas streams cujo uso seja permitido pelos respectivos fornecedores/licenciantes.
+O GitHub executa schedules apenas quando o workflow está na branch padrão; pode haver atrasos. Em forks, pode ser necessário habilitar Actions/agendamento manualmente. Esta proposta permanece em branch separada, sem integração; portanto a agenda nova ainda não está ativa. O workflow antigo da main não é alterado por esta branch.
+
+Original preservado em `backup/original-21647b3`, commit `21647b3`. Alterações em `fix/authorized-stream-validation`.

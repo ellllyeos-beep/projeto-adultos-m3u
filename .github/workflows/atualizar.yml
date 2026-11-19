@@ -1,42 +1,35 @@
-name: Atualizar lista M3U Adultos
-
+name: Atualizar lista M3U autorizada
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: '17 */6 * * *'
   workflow_dispatch:
-
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: playlist-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   atualizar:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
+    permissions:
+      contents: write
     steps:
-      - name: Baixar projeto
-        uses: actions/checkout@v4
-
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: '3.12'
           cache: pip
-
-      - name: Instalar dependências
-        run: pip install -r requirements.txt
-
-      - name: Gerar playlist
-        run: python gerar_m3u.py
-
-      - name: Publicar alterações
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python gerar_m3u.py
+      - name: Publicar arquivos gerados
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add adultos.m3u status.json
-          if git diff --cached --quiet; then
-            echo "Nenhuma alteração na playlist."
-          else
-            git commit -m "Atualizar playlist adultos"
-            git push
+          if ! git diff --cached --quiet; then
+            git commit -m 'Atualizar playlist autorizada'
+            git push origin HEAD:main
           fi
